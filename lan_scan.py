@@ -4,11 +4,13 @@
 - 自动发现本机局域网存活主机
 - 端口服务探测 + 已知漏洞检测
 - HTML 报告输出
+- 图形界面 (tkinter) + 命令行双模式
 - 无外部依赖，纯标准库
 
 Usage:
-    python3 lan_scan.py               # 自动扫描本机所在网段
-    python3 lan_scan.py --net 192.168.1.0/24  # 指定网段
+    python3 lan_scan.py                          # 图形界面
+    python3 lan_scan.py --cli                    # 命令行模式
+    python3 lan_scan.py --net 192.168.1.0/24     # 指定网段
     python3 lan_scan.py --ips 192.168.1.1,192.168.1.2  # 指定IP
     python3 lan_scan.py --output scan_report.html  # 指定输出文件
 """
@@ -22,6 +24,8 @@ import sys
 import os
 import json
 import ipaddress
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
 from datetime import datetime
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -81,7 +85,6 @@ WEB_ADMIN_PATHS = [
 def get_local_network():
     """获取本机所在局域网网段"""
     try:
-        # macOS / Linux
         result = subprocess.run(
             ["ip", "-4", "route", "show", "default"],
             capture_output=True, text=True, timeout=5
@@ -92,7 +95,7 @@ def get_local_network():
                 for i, p in enumerate(parts):
                     if p == "dev":
                         iface = parts[i+1]
-                        if iface == "en0":  # WiFi
+                        if iface == "en0":
                             return "192.168.0.0/16"
                         elif iface.startswith("en"):
                             return "172.16.0.0/12"
@@ -101,7 +104,6 @@ def get_local_network():
     except Exception:
         pass
 
-    # 备选：通过 ARP 表
     try:
         result = subprocess.run(
             ["arp", "-an"], capture_output=True, text=True, timeout=5
@@ -117,18 +119,15 @@ def get_local_network():
     except Exception:
         pass
 
-    return "192.168.0.0/16"  # 默认
+    return "192.168.0.0/16"
 
 
-def discover_hosts(net_cidr="auto"):
+def discover_hosts(net_cidr="auto", thread_pool_size=64):
     """ARP 扫描发现存活主机（快速、免 root）"""
     if net_cidr == "auto":
         net_cidr = get_local_network()
 
     network = ipaddress.ip_network(net_cidr, strict=False)
-    print(f"[+] 网段: {network}")
-    print(f"[+] ARP 扫描中...")
-
     hosts = []
     lock = threading.Lock()
     current = 0
@@ -139,25 +138,21 @@ def discover_hosts(net_cidr="auto"):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(0.3)
-            s.connect((str(ip), 9))  # Discard protocol
+            s.connect((str(ip), 9))
             s.close()
             with lock:
                 current += 1
-                if current % 50 == 0:
-                    sys.stdout.write(f"\r[+] 扫描进度: {current}/{total}")
-                    sys.stdout.flush()
             return str(ip)
         except (socket.timeout, OSError):
             return None
 
-    with ThreadPoolExecutor(max_workers=min(THREAD_POOL_SIZE, total)) as executor:
+    with ThreadPoolExecutor(max_workers=min(thread_pool_size, total)) as executor:
         futures = {executor.submit(ping_one, host): host for host in network.hosts()}
         for future in as_completed(futures):
             result = future.result()
             if result:
                 hosts.append(result)
 
-    print(f"\r[+] 扫描完成! 发现 {len(hosts)} 台存活主机\n")
     return sorted(hosts)
 
 
@@ -167,29 +162,12 @@ def discover_hosts_manual(ips=None):
         hosts = ips
     else:
         hosts = ["127.0.0.1"]
-    print(f"[+] 扫描 {len(hosts)} 个目标...")
     return sorted(hosts)
 
 
 # ====================================================================
 # 端口 & 服务探测
 # ====================================================================
-
-def banner_grab(ip, port, timeout=2):
-    """抓取服务 banner"""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect((ip, port))
-        try:
-            banner = s.recv(1024).decode("utf-8", errors="ignore").strip()
-        except:
-            banner = ""
-        s.close()
-        return banner[:256]
-    except (socket.timeout, OSError, ConnectionRefusedError):
-        return None
-
 
 def scan_port(ip, port, timeout=1.5):
     """扫描单个端口，返回 (端口, 状态, 服务名, CVE, 描述, banner, severity)"""
@@ -231,7 +209,7 @@ def scan_port(ip, port, timeout=1.5):
 def check_web_admin(ip, port, timeout=3):
     """检测 Web 后台/管理面板"""
     findings = []
-    paths = WEB_ADMIN_PATHS[:8]  # 限制扫描数量
+    paths = WEB_ADMIN_PATHS[:8]
 
     def check_path(path):
         try:
@@ -258,9 +236,8 @@ def check_web_admin(ip, port, timeout=3):
 # 综合扫描
 # ====================================================================
 
-def scan_host(ip):
+def scan_host(ip, thread_pool_size=64):
     """对单个主机进行综合扫描"""
-    print(f"[*] 扫描 {ip} ...")
     results = {
         "ip": ip,
         "open_ports": [],
@@ -271,8 +248,7 @@ def scan_host(ip):
 
     open_ports = []
 
-    # 并发扫描端口
-    with ThreadPoolExecutor(max_workers=min(THREAD_POOL_SIZE, len(SCAN_PORTS))) as executor:
+    with ThreadPoolExecutor(max_workers=min(thread_pool_size, len(SCAN_PORTS))) as executor:
         futures = {executor.submit(scan_port, ip, port): port for port in SCAN_PORTS}
         for f in as_completed(futures):
             port, status, service, cve, desc, banner, severity = f.result()
@@ -288,7 +264,6 @@ def scan_host(ip):
                 }
                 results["open_ports"].append(findings)
 
-    # 发现端口后，检查 Web 后台
     web_ports = [p for p in open_ports if p in (80, 443, 8080, 8443, 9090, 3306, 9200, 27017)]
     if web_ports:
         for wp in web_ports:
@@ -296,7 +271,6 @@ def scan_host(ip):
             if admin_findings:
                 results["web_admin"].extend(admin_findings)
 
-    # 汇总漏洞
     vuln_count = sum(1 for p in results["open_ports"] if p.get("cve"))
     high_count = sum(1 for p in results["open_ports"] if p.get("severity") == "high")
     results["summary"] = {
@@ -306,7 +280,6 @@ def scan_host(ip):
         "web_admin_findings": len(results["web_admin"]),
     }
 
-    # 按严重性排序
     results["open_ports"].sort(key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x.get("severity", "low"), 3))
 
     return results
@@ -391,7 +364,6 @@ def generate_html_report(results, output_file):
         ips = r.get("ip", "unknown")
         s = r["summary"]
 
-        # 严重性 badge
         if s["high_severity"]:
             badge_class = "badge-high"
             badge_text = f"🔴 {s['high_severity']} 高危"
@@ -448,7 +420,7 @@ def generate_html_report(results, output_file):
 
     html += f"""
 <div class="footer">
-  扫描工具: LanScan v1.0 | 仅供授权的安全评估使用 |
+  扫描工具: LanScan v2.0 | 仅供授权的安全评估使用 |
   扫描时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 </div>
 </body>
@@ -466,68 +438,315 @@ def _escape(text):
 
 
 # ====================================================================
+# 图形界面
+# ====================================================================
+
+class ScanGUI:
+    """扫描工具的图形界面"""
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title("🛡️ 局域网漏洞扫描工具 v2.0")
+        self.root.geometry("720x520")
+        self.root.resizable(True, True)
+        self.scanning = False
+
+        self._build_ui()
+
+    def _build_ui(self):
+        # ===== 顶部：扫描模式选择 =====
+        mode_frame = ttk.LabelFrame(self.root, text="扫描模式", padding=10)
+        mode_frame.pack(fill="x", padx=10, pady=(10, 5))
+
+        self.mode_var = tk.StringVar(value="subnet")
+        ttk.Radiobutton(mode_frame, text="自动扫描（检测本机网段）", variable=self.mode_var, value="auto").pack(side="left", padx=10)
+        ttk.Radiobutton(mode_frame, text="指定网段", variable=self.mode_var, value="subnet").pack(side="left", padx=10)
+        ttk.Radiobutton(mode_frame, text="指定IP", variable=self.mode_var, value="ips").pack(side="left", padx=10)
+
+        # ===== 网段/IP 输入区 =====
+        input_frame = ttk.LabelFrame(self.root, text="扫描目标", padding=10)
+        input_frame.pack(fill="x", padx=10, pady=5)
+
+        self.net_entry = ttk.Entry(input_frame, width=40)
+        self.net_entry.insert(0, "auto")
+        self.net_entry_label = ttk.Label(input_frame, text="网段 (CIDR，如 192.168.1.0/24，填 auto 自动检测)")
+        self.net_entry_label.pack(side="left", padx=(0, 5))
+        self.net_entry.pack(side="left", fill="x", expand=True)
+
+        self.ips_entry = ttk.Entry(input_frame, width=40)
+        self.ips_entry.pack_forget()
+
+        # ===== 高级选项 =====
+        advanced_frame = ttk.LabelFrame(self.root, text="高级选项", padding=10)
+        advanced_frame.pack(fill="x", padx=10, pady=5)
+
+        opts_row1 = ttk.Frame(advanced_frame)
+        opts_row1.pack(fill="x", pady=2)
+
+        ttk.Label(opts_row1, text="并发线程数:").pack(side="left", padx=(0, 5))
+        self.threads_var = tk.StringVar(value=str(THREAD_POOL_SIZE))
+        ttk.Spinbox(opts_row1, from_=1, to=256, textvariable=self.threads_var, width=6).pack(side="left", padx=(0, 20))
+
+        ttk.Label(opts_row1, text="端口超时(秒):").pack(side="left", padx=(0, 5))
+        self.timeout_var = tk.StringVar(value="1.5")
+        ttk.Spinbox(opts_row1, from_=0.5, to=10, increment=0.5, textvariable=self.timeout_var, width=6).pack(side="left", padx=(0, 20))
+
+        opts_row2 = ttk.Frame(advanced_frame)
+        opts_row2.pack(fill="x", pady=2)
+
+        self.check_web = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opts_row2, text="检测 Web 管理后台", variable=self.check_web).pack(side="left", padx=(0, 20))
+
+        self.check_cves = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opts_row2, text="只显示有 CVE 漏洞的端口", variable=self.check_cves).pack(side="left", padx=(0, 20))
+
+        # ===== 输出设置 =====
+        output_frame = ttk.LabelFrame(self.root, text="输出设置", padding=10)
+        output_frame.pack(fill="x", padx=10, pady=5)
+
+        self.output_var = tk.StringVar(value=f"scan_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html")
+        ttk.Entry(output_frame, textvariable=self.output_var, width=40).pack(side="left", fill="x", expand=True, padx=(0, 5))
+        ttk.Button(output_frame, text="浏览...", command=self._browse_output).pack(side="left")
+
+        # ===== 进度条 =====
+        progress_frame = ttk.Frame(self.root)
+        progress_frame.pack(fill="x", padx=10, pady=5)
+
+        self.progress = ttk.Progressbar(progress_frame, mode="indeterminate")
+        self.progress.pack(fill="x", side="left", expand=True, padx=(0, 10))
+
+        self.status_var = tk.StringVar(value="就绪")
+        ttk.Label(progress_frame, textvariable=self.status_var, foreground="#888").pack(side="left", fill="x", expand=True)
+
+        # ===== 按钮 =====
+        btn_frame = ttk.Frame(self.root)
+        btn_frame.pack(fill="x", padx=10, pady=5)
+
+        self.start_btn = ttk.Button(btn_frame, text="▶ 开始扫描", command=self._start_scan)
+        self.start_btn.pack(side="left", padx=(0, 5))
+
+        self.stop_btn = ttk.Button(btn_frame, text="⏹ 停止", command=self._stop_scan, state="disabled")
+        self.stop_btn.pack(side="left", padx=(0, 5))
+
+        ttk.Button(btn_frame, text="📋 打开报告", command=self._open_report).pack(side="left")
+
+        # ===== 日志区域 =====
+        log_frame = ttk.LabelFrame(self.root, text="扫描日志", padding=5)
+        log_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.log_text = tk.Text(log_frame, height=8, state="disabled", bg="#1a1a2e", fg="#e0e0e0",
+                                font=("Consolas", 9), wrap="word")
+        scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        self.log_text.pack(side="left", fill="both", expand=True)
+
+    def _browse_output(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".html",
+            filetypes=[("HTML files", "*.html"), ("All files", "*.*")],
+            initialfile=f"scan_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+        )
+        if path:
+            self.output_var.set(path)
+
+    def _log(self, msg):
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", msg + "\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def _update_status(self, msg):
+        self.status_var.set(msg)
+        self.root.update_idletasks()
+
+    def _get_targets(self):
+        mode = self.mode_var.get()
+        if mode == "auto":
+            return "auto", None
+        elif mode == "subnet":
+            net = self.net_entry.get().strip()
+            if not net:
+                messagebox.showwarning("提示", "请输入网段地址")
+                return None, None
+            return net, None
+        else:  # ips
+            ips_str = self.ips_entry.get().strip()
+            if not ips_str:
+                messagebox.showwarning("提示", "请输入IP地址")
+                return None, None
+            ips = [i.strip() for i in ips_str.replace(",", "\n").splitlines() if i.strip()]
+            return None, ips
+
+    def _toggle_ui(self, scanning):
+        self.scanning = scanning
+        self.start_btn.configure(state="disabled" if scanning else "normal")
+        self.stop_btn.configure(state="normal" if scanning else "disabled")
+        self.net_entry.configure(state="disabled" if scanning else "normal")
+        self.ips_entry.configure(state="disabled" if scanning else "normal")
+        for rb in self.root.winfo_children():
+            for w in rb.winfo_children():
+                if isinstance(w, ttk.Radiobutton):
+                    w.configure(state="disabled" if scanning else "normal")
+
+    def _start_scan(self):
+        net_or_ips, ips_list = self._get_targets()
+        if net_or_ips is None:
+            return
+
+        self._toggle_ui(True)
+        self.progress.start()
+        self._log("=" * 50)
+        self._log(f"[{datetime.now().strftime('%H:%M:%S')}] 开始扫描...")
+
+        threads = int(self.threads_var.get())
+        timeout = float(self.timeout_var.get())
+        output_file = self.output_var.get()
+        scan_cves_only = self.check_cves.get()
+
+        def run_scan():
+            try:
+                # 步骤 1: 发现主机
+                if ips_list:
+                    self._update_status("正在解析 IP 列表...")
+                    hosts = discover_hosts_manual(ips_list)
+                elif net_or_ips == "auto":
+                    self._update_status("正在检测本机网段...")
+                    self._log("[+] 自动检测本机网段...")
+                    hosts = discover_hosts(thread_pool_size=threads)
+                else:
+                    self._update_status(f"正在扫描网段 {net_or_ips}...")
+                    self._log(f"[+] 网段: {net_or_ips}")
+                    hosts = discover_hosts(net_or_ips, thread_pool_size=threads)
+
+                if not hosts:
+                    self._log("[!] 未发现存活主机")
+                    self.root.after(0, lambda: messagebox.showinfo("结果", "未发现存活主机"))
+                    self.root.after(0, self._finish_scan)
+                    return
+
+                self._log(f"[+] 发现 {len(hosts)} 台存活主机")
+                self._log(f"    目标: {', '.join(hosts[:10])}{'...' if len(hosts) > 10 else ''}")
+
+                # 步骤 2: 扫描主机
+                self._log(f"[*] 开始端口扫描 ({len(hosts)} 台主机)...")
+                results = []
+                completed = 0
+
+                with ThreadPoolExecutor(max_workers=min(threads, len(hosts))) as executor:
+                    futures = {executor.submit(scan_host, ip, threads): ip for ip in hosts}
+                    for future in as_completed(futures):
+                        try:
+                            r = future.result()
+                            results.append(r)
+                        except Exception as e:
+                            self._log(f"[!] 扫描失败: {future.result()}: {e}")
+                        completed += 1
+                        self.root.after(0, lambda c=completed, t=len(hosts): self._update_status(f"扫描进度: {c}/{t}"))
+
+                self._log(f"[*] 扫描完成! 共 {len(hosts)} 台主机")
+
+                # 过滤
+                if scan_cves_only:
+                    results = [r for r in results if r["summary"]["vulnerabilities_count"] > 0]
+                    self._log(f"[+] 过滤后: {len(results)} 台有漏洞的主机")
+
+                # 生成报告
+                self._update_status("正在生成报告...")
+                generate_html_report(results, output_file)
+                self._log(f"[+] HTML 报告已保存: {os.path.abspath(output_file)}")
+
+                total_high = sum(r["summary"]["high_severity"] for r in results)
+                if total_high > 0:
+                    self._log(f"⚠️  发现 {total_high} 个高危漏洞！")
+
+                self.root.after(0, lambda: messagebox.showinfo("扫描完成", f"扫描完成！\n发现 {len(hosts)} 台主机\n报告已保存: {output_file}"))
+
+            except Exception as e:
+                self._log(f"[!] 扫描出错: {e}")
+                self.root.after(0, lambda: messagebox.showerror("错误", str(e)))
+            finally:
+                self.root.after(0, self._finish_scan)
+
+        threading.Thread(target=run_scan, daemon=True).start()
+
+    def _stop_scan(self):
+        self._log("[!] 用户取消扫描")
+        self._finish_scan()
+
+    def _finish_scan(self):
+        self.progress.stop()
+        self._toggle_ui(False)
+        self._update_status("就绪")
+
+    def _open_report(self):
+        output_file = self.output_var.get().strip()
+        if not output_file:
+            messagebox.showwarning("提示", "请先设置输出文件路径")
+            return
+        if os.path.exists(output_file):
+            if sys.platform == "win32":
+                os.startfile(output_file)
+            elif sys.platform == "darwin":
+                subprocess.call(["open", output_file])
+            else:
+                subprocess.call(["xdg-open", output_file])
+        else:
+            messagebox.showinfo("提示", "报告文件不存在，请先执行扫描")
+
+
+# ====================================================================
 # 主流程
 # ====================================================================
 
 def parse_args():
     import argparse
     parser = argparse.ArgumentParser(description="局域网漏洞扫描工具", add_help=False)
-    parser.add_argument("--net", type=str, default="auto", help="CIDR 网段，如 192.168.1.0/24（默认自动检测）")
-    parser.add_argument("--ips", type=str, default=None, help="逗号分隔的 IP 列表，如 192.168.1.1,192.168.1.2")
-    parser.add_argument("--output", type=str, default="scan_report.html", help="输出 HTML 报告路径")
+    parser.add_argument("--net", type=str, default="auto", help="CIDR 网段")
+    parser.add_argument("--ips", type=str, default=None, help="逗号分隔的 IP 列表")
+    parser.add_argument("--output", type=str, default=None, help="输出 HTML 报告路径")
     parser.add_argument("--json", type=str, default=None, help="同时输出 JSON 文件")
     parser.add_argument("--threads", type=int, default=THREAD_POOL_SIZE, help="并发线程数")
+    parser.add_argument("--cli", action="store_true", help="强制命令行模式")
     parser.add_argument("--help", "-h", action="store_true", help="显示帮助")
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
-
-    if args.help:
-        print(__doc__)
-        print("Examples:")
-        print("  python3 lan_scan.py                        # 自动扫描")
-        print("  python3 lan_scan.py --net 192.168.1.0/24   # 指定网段")
-        print("  python3 lan_scan.py --ips 192.168.1.1      # 指定IP")
-        print("  python3 lan_scan.py --output report.html   # 指定输出")
-        return
-
+def cli_main(args):
+    """命令行模式主函数"""
     start_time = time.time()
 
-    # 步骤 1: 发现存活主机
     if args.ips:
-        ips = [i.strip() for i in args.ips.split(",") if i.strip()]
-        hosts = ips
+        hosts = [i.strip() for i in args.ips.split(",") if i.strip()]
     elif args.net == "auto":
-        hosts = discover_hosts()
+        hosts = discover_hosts(thread_pool_size=args.threads)
     else:
-        hosts = discover_hosts(args.net)
+        hosts = discover_hosts(args.net, thread_pool_size=args.threads)
 
     if not hosts:
         print("[!] 未发现存活主机，退出")
         return
 
-    # 步骤 2: 综合扫描
+    output_file = args.output or f"scan_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+
     print(f"[*] 开始扫描 {len(hosts)} 台主机...")
     results = []
     completed = 0
 
-    with ThreadPoolExecutor(max_workers=min(THREAD_POOL_SIZE, len(hosts))) as executor:
-        futures = {executor.submit(scan_host, ip): ip for ip in hosts}
+    with ThreadPoolExecutor(max_workers=min(args.threads, len(hosts))) as executor:
+        futures = {executor.submit(scan_host, ip, args.threads): ip for ip in hosts}
         for f in as_completed(futures):
             try:
                 r = f.result()
                 results.append(r)
             except Exception as e:
-                print(f"[!] 扫描失败: {f.result()}: {e}")
+                print(f"[!] 扫描失败: {e}")
             completed += 1
             sys.stdout.write(f"\r[*] 进度: {completed}/{len(hosts)}")
             sys.stdout.flush()
 
     print(f"\r[*] 扫描完成! 共 {len(hosts)} 台主机\n")
 
-    # 终端输出摘要
     print("=" * 60)
     print("  📊 扫描结果摘要")
     print("=" * 60)
@@ -537,10 +756,7 @@ def main():
         if not s["open_ports_count"]:
             continue
         print(f"\n  🖥️  {r['ip']}")
-        print(f"     开放端口: {s['open_ports_count']} 个 | "
-              f"漏洞: {s['vulnerabilities_count']} 个 | "
-              f"高危: {s['high_severity']} 个 | "
-              f"Web 后台: {s['web_admin_findings']} 个")
+        print(f"     开放端口: {s['open_ports_count']} | 漏洞: {s['vulnerabilities_count']} | 高危: {s['high_severity']}")
         for p in r["open_ports"][:5]:
             sev = p.get("severity", "?").upper()
             cve = p.get("cve", "")
@@ -550,25 +766,35 @@ def main():
             print(f"       {tag} {p['port']}/tcp {p['service']:15s}{cve_str}{banner_str}")
 
     elapsed = time.time() - start_time
-
-    # 生成报告
-    output_file = generate_html_report(results, args.output)
+    generate_html_report(results, output_file)
     print(f"\n[*] HTML 报告已保存到: {os.path.abspath(output_file)}")
 
-    # 可选 JSON 输出
     if args.json:
-        # 移除不可序列化的数据
-        serializable = results
         with open(args.json, "w", encoding="utf-8") as f:
-            json.dump(serializable, f, ensure_ascii=False, indent=2)
+            json.dump(results, f, ensure_ascii=False, indent=2)
         print(f"[*] JSON 报告已保存到: {os.path.abspath(args.json)}")
 
     print(f"\n[*] 总耗时: {elapsed:.1f} 秒")
 
-    # 高危提示
     total_high = sum(r["summary"]["high_severity"] for r in results)
     if total_high > 0:
         print(f"\n⚠️  发现 {total_high} 个高危漏洞！建议尽快修复。")
+
+
+def main():
+    args = parse_args()
+
+    if args.help:
+        print(__doc__)
+        return
+
+    # 如果有 CLI 参数则走命令行模式，否则启动 GUI
+    if args.cli or args.ips or args.net != "auto" or args.json:
+        cli_main(args)
+    else:
+        root = tk.Tk()
+        app = ScanGUI(root)
+        root.mainloop()
 
 
 if __name__ == "__main__":

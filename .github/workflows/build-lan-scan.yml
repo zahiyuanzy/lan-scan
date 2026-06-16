@@ -15,12 +15,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
 
       - name: Install dependencies
         run: |
@@ -29,11 +30,11 @@ jobs:
 
       - name: Build EXE
         run: |
+          Copy-Item lan_scan.py .
           pyinstaller ^
             --onefile ^
             --clean ^
             --name lan_scan ^
-            --add-data "lan_scan.py;." ^
             lan_scan.py
 
       - name: Upload artifact

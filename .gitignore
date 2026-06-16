@@ -19,12 +19,3 @@ build/
 *.json
 *.xlsx
 
-# Downloads subdirectories (except .github and lan_scan.py)
-Claude/
-opencli-extension-v1.0.0/
-wecom-images/
-hindsight
-
-# Video projects
-*/*.mp4
-*/*.png

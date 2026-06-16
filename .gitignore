@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+.localized
+
+# Generated files
+*.exe
+*.html
+*.json
+*.xlsx
+
+# Downloads subdirectories (except .github and lan_scan.py)
+Claude/
+opencli-extension-v1.0.0/
+wecom-images/
+hindsight
+
+# Video projects
+*/*.mp4
+*/*.png

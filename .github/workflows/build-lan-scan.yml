@@ -15,8 +15,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -29,13 +27,11 @@ jobs:
           pip install pyinstaller
 
       - name: Build EXE
+        shell: pwsh
         run: |
-          Copy-Item lan_scan.py .
-          pyinstaller ^
-            --onefile ^
-            --clean ^
-            --name lan_scan ^
-            lan_scan.py
+          Write-Host "Files in repo: $(Get-ChildItem -Name)"
+          Write-Host "Python: $(python --version)"
+          pyinstaller --onefile --clean --name lan_scan lan_scan.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

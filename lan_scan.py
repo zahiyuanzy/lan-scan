@@ -943,6 +943,45 @@ def _parse_cli_port_input(port_str):
         return port_str, sorted(SCAN_PORTS.keys())
 
 
+def _probe_port(ip, port, timeout=1.5):
+    """探测单个端口是否开放（模块级函数）"""
+    svc = SCAN_PORTS.get(port)
+    if svc:
+        service, cve, desc = svc
+    else:
+        service = f"Port-{port}"
+        cve = None
+        desc = "未知服务"
+
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        conn_result = s.connect_ex((ip, port))
+        if conn_result != 0:
+            s.close()
+            return (port, "closed", service, cve, desc, "", "low")
+
+        banner = ""
+        try:
+            banner = s.recv(1024).decode("utf-8", errors="ignore").strip()
+        except:
+            pass
+        s.close()
+
+        severity = "low"
+        if banner:
+            severity = "medium"
+            if "vsftpd 3.0.3" in banner.lower():
+                severity = "high"
+            if "openssh 7." in banner.lower() or "openssh 8." in banner.lower():
+                severity = "high"
+
+        return (port, "open", service, cve, desc, banner, severity)
+
+    except (socket.timeout, OSError, ConnectionRefusedError):
+        return (port, "closed", service, cve, desc, "", "low")
+
+
 def _scan_single_host_cli(ip, target_ports, thread_pool_size):
     """CLI 模式: 扫描单个主机端口"""
     results = {

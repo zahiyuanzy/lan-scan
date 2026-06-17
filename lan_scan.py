@@ -462,6 +462,7 @@ class ScanGUI:
         mode_frame.pack(fill="x", padx=10, pady=(10, 5))
 
         self.mode_var = tk.StringVar(value="subnet")
+        self.mode_var.trace_add("write", lambda *args: self._on_mode_change())
         ttk.Radiobutton(mode_frame, text="自动扫描（检测本机网段）", variable=self.mode_var, value="auto").pack(side="left", padx=10)
         ttk.Radiobutton(mode_frame, text="指定网段", variable=self.mode_var, value="subnet").pack(side="left", padx=10)
         ttk.Radiobutton(mode_frame, text="指定IP", variable=self.mode_var, value="ips").pack(side="left", padx=10)
@@ -551,6 +552,38 @@ class ScanGUI:
         scrollbar.pack(side="right", fill="y")
         self.log_text.pack(side="left", fill="both", expand=True)
 
+    def _on_mode_change(self, *args):
+        """切换扫描模式时清空输入框并显示对应提示"""
+        mode = self.mode_var.get()
+        # Clear all input fields
+        self.net_entry.delete(0, "end")
+        self.ips_entry.delete(0, "end")
+        self.port_entry.delete(0, "end")
+
+        # Reset all to hidden
+        self.net_entry.pack_forget()
+        self.net_entry_label.pack_forget()
+        self.ips_entry.pack_forget()
+        self.port_entry.pack_forget()
+        # Remove any extra hint labels from previous mode
+        for w in self.net_entry.master.winfo_children():
+            if isinstance(w, ttk.Label) and w not in (self.net_entry_label, self.port_entry_label):
+                try:
+                    w.pack_forget()
+                except:
+                    pass
+
+        if mode == "subnet":
+            self.net_entry.insert(0, "auto")
+            self.net_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
+            self.net_entry_label.pack(side="left")
+        elif mode == "ips":
+            self.ips_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
+            ttk.Label(self.ips_entry.master, text="多个IP用逗号或换行分隔，如 192.168.1.1,192.168.1.2").pack(side="left")
+        elif mode == "port_scan":
+            self.port_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
+            ttk.Label(self.port_entry.master, text="目标IP:端口（如 192.168.1.1 或 192.168.1.1:80,443 或 all）").pack(side="left")
+
     def _browse_output(self):
         path = filedialog.asksaveasfilename(
             defaultextension=".html",
@@ -619,23 +652,6 @@ class ScanGUI:
         self.progress.start()
         self._log("=" * 50)
         self._log(f"[{datetime.now().strftime('%H:%M:%S')}] 开始扫描...")
-
-        # Show/hide input fields based on mode
-        mode = self.mode_var.get()
-        self.net_entry.pack_forget()
-        self.net_entry_label.pack_forget()
-        self.ips_entry.pack_forget()
-        self.port_entry.pack_forget()
-        self.port_entry_label.pack_forget()
-
-        if mode == "subnet":
-            self.net_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
-            self.net_entry_label.pack(side="left")
-        elif mode == "ips":
-            self.ips_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
-        else:
-            self.port_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
-            self.port_entry_label.pack(side="left")
 
         threads = int(self.threads_var.get())
         timeout = float(self.timeout_var.get())

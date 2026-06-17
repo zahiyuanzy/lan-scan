@@ -10,6 +10,9 @@
 Usage:
     python3 lan_scan.py                          # 图形界面
     python3 lan_scan.py --cli                    # 命令行模式
+    python3 lan_scan.py --port-scan 192.168.1.1  # 端口探测
+    python3 lan_scan.py --port-scan 192.168.1.1:80,443  # 指定端口
+    python3 lan_scan.py --port-scan 192.168.1.1:all  # 全部端口
     python3 lan_scan.py --net 192.168.1.0/24     # 指定网段
     python3 lan_scan.py --ips 192.168.1.1,192.168.1.2  # 指定IP
     python3 lan_scan.py --output scan_report.html  # 指定输出文件
@@ -355,7 +358,7 @@ def generate_html_report(results, output_file):
     <div class="label">已知漏洞</div></div>
   <div class="summary-card"><div class="num" style="color:#dc3545">{sum(r["summary"]["high_severity"] for r in results)}</div>
     <div class="label">高危</div></div>
-  <div class="summary-card"><div class="num" style="color:#4ec9b0">{sum(r["summary"]["web_admin_findings"] for r in results)}</div>
+  <div class="summary-card"><div class="num" style="color:#4ec9b0">{sum(r["summary"].get("web_admin_findings", 0) for r in results)}</div>
     <div class="label">Web 后台</div></div>
 </div>
 """
@@ -462,6 +465,7 @@ class ScanGUI:
         ttk.Radiobutton(mode_frame, text="自动扫描（检测本机网段）", variable=self.mode_var, value="auto").pack(side="left", padx=10)
         ttk.Radiobutton(mode_frame, text="指定网段", variable=self.mode_var, value="subnet").pack(side="left", padx=10)
         ttk.Radiobutton(mode_frame, text="指定IP", variable=self.mode_var, value="ips").pack(side="left", padx=10)
+        ttk.Radiobutton(mode_frame, text="端口探测", variable=self.mode_var, value="port_scan").pack(side="left", padx=10)
 
         # ===== 网段/IP 输入区 =====
         input_frame = ttk.LabelFrame(self.root, text="扫描目标", padding=10)
@@ -475,6 +479,12 @@ class ScanGUI:
 
         self.ips_entry = ttk.Entry(input_frame, width=40)
         self.ips_entry.pack_forget()
+
+        # Port scan target input
+        self.port_entry = ttk.Entry(input_frame, width=40)
+        self.port_entry.pack_forget()
+        self.port_entry_label = ttk.Label(input_frame, text="目标IP + 端口范围（如 192.168.1.1 或 192.168.1.1:80,443,8080 或 all）")
+        self.port_entry_label.pack_forget()
 
         # ===== 高级选项 =====
         advanced_frame = ttk.LabelFrame(self.root, text="高级选项", padding=10)
@@ -563,20 +573,26 @@ class ScanGUI:
     def _get_targets(self):
         mode = self.mode_var.get()
         if mode == "auto":
-            return "auto", None
+            return "auto", None, None
         elif mode == "subnet":
             net = self.net_entry.get().strip()
             if not net:
                 messagebox.showwarning("提示", "请输入网段地址")
-                return None, None
-            return net, None
-        else:  # ips
+                return None, None, None
+            return net, None, None
+        elif mode == "ips":
             ips_str = self.ips_entry.get().strip()
             if not ips_str:
                 messagebox.showwarning("提示", "请输入IP地址")
-                return None, None
+                return None, None, None
             ips = [i.strip() for i in ips_str.replace(",", "\n").splitlines() if i.strip()]
-            return None, ips
+            return None, ips, None
+        else:  # port_scan
+            port_str = self.port_entry.get().strip()
+            if not port_str:
+                messagebox.showwarning("提示", "请输入目标IP和端口")
+                return None, None, None
+            return None, None, port_str
 
     def _toggle_ui(self, scanning):
         self.scanning = scanning
@@ -584,20 +600,42 @@ class ScanGUI:
         self.stop_btn.configure(state="normal" if scanning else "disabled")
         self.net_entry.configure(state="disabled" if scanning else "normal")
         self.ips_entry.configure(state="disabled" if scanning else "normal")
+        self.port_entry.configure(state="disabled" if scanning else "normal")
         for rb in self.root.winfo_children():
             for w in rb.winfo_children():
                 if isinstance(w, ttk.Radiobutton):
                     w.configure(state="disabled" if scanning else "normal")
 
     def _start_scan(self):
-        net_or_ips, ips_list = self._get_targets()
-        if net_or_ips is None:
+        target = self._get_targets()
+        if target[0] is None and target[1] is None and target[2] is None:
             return
+
+        net_or_subnet = target[0]
+        ips_list = target[1]
+        port_str = target[2]
 
         self._toggle_ui(True)
         self.progress.start()
         self._log("=" * 50)
         self._log(f"[{datetime.now().strftime('%H:%M:%S')}] 开始扫描...")
+
+        # Show/hide input fields based on mode
+        mode = self.mode_var.get()
+        self.net_entry.pack_forget()
+        self.net_entry_label.pack_forget()
+        self.ips_entry.pack_forget()
+        self.port_entry.pack_forget()
+        self.port_entry_label.pack_forget()
+
+        if mode == "subnet":
+            self.net_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
+            self.net_entry_label.pack(side="left")
+        elif mode == "ips":
+            self.ips_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        else:
+            self.port_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
+            self.port_entry_label.pack(side="left")
 
         threads = int(self.threads_var.get())
         timeout = float(self.timeout_var.get())
@@ -606,48 +644,74 @@ class ScanGUI:
 
         def run_scan():
             try:
-                # 步骤 1: 发现主机
-                if ips_list:
-                    self._update_status("正在解析 IP 列表...")
-                    hosts = discover_hosts_manual(ips_list)
-                elif net_or_ips == "auto":
+                hosts = []
+                target_ports = []
+                is_port_scan = False
+
+                if mode == "auto":
                     self._update_status("正在检测本机网段...")
                     self._log("[+] 自动检测本机网段...")
                     hosts = discover_hosts(thread_pool_size=threads)
-                else:
-                    self._update_status(f"正在扫描网段 {net_or_ips}...")
-                    self._log(f"[+] 网段: {net_or_ips}")
-                    hosts = discover_hosts(net_or_ips, thread_pool_size=threads)
+                elif mode == "subnet":
+                    self._update_status(f"正在扫描网段 {net_or_subnet}...")
+                    self._log(f"[+] 网段: {net_or_subnet}")
+                    hosts = discover_hosts(net_or_subnet, thread_pool_size=threads)
+                elif mode == "ips":
+                    self._update_status("正在解析 IP 列表...")
+                    hosts = discover_hosts_manual(ips_list)
+                elif mode == "port_scan":
+                    is_port_scan = True
+                    self._update_status("正在解析目标...")
+                    host, ports = self._parse_port_scan_input(port_str)
+                    if host:
+                        hosts = [host]
+                        target_ports = ports
 
                 if not hosts:
-                    self._log("[!] 未发现存活主机")
-                    self.root.after(0, lambda: messagebox.showinfo("结果", "未发现存活主机"))
+                    self._log("[!] 未输入有效目标")
+                    self.root.after(0, lambda: messagebox.showinfo("结果", "未输入有效目标"))
                     self.root.after(0, self._finish_scan)
                     return
 
-                self._log(f"[+] 发现 {len(hosts)} 台存活主机")
-                self._log(f"    目标: {', '.join(hosts[:10])}{'...' if len(hosts) > 10 else ''}")
+                if is_port_scan:
+                    self._log(f"[+] 目标: {hosts[0]} 端口: {','.join(str(p) for p in target_ports) if target_ports else '全部'}")
+                    self._log(f"[*] 开始端口探测...")
+                    results = []
+                    completed = 0
+                    total = len(hosts)
 
-                # 步骤 2: 扫描主机
-                self._log(f"[*] 开始端口扫描 ({len(hosts)} 台主机)...")
-                results = []
-                completed = 0
+                    with ThreadPoolExecutor(max_workers=min(threads, len(hosts))) as executor:
+                        futures = {executor.submit(self._scan_single_host, ip, target_ports, threads): ip for ip in hosts}
+                        for future in as_completed(futures):
+                            try:
+                                r = future.result()
+                                results.append(r)
+                            except Exception as e:
+                                self._log(f"[!] 扫描失败: {e}")
+                            completed += 1
+                            self.root.after(0, lambda c=completed, t=total: self._update_status(f"扫描进度: {c}/{t}"))
+                else:
+                    self._log(f"[+] 发现 {len(hosts)} 台主机")
+                    self._log(f"    目标: {', '.join(hosts[:10])}{'...' if len(hosts) > 10 else ''}")
+                    self._log(f"[*] 开始端口扫描 ({len(hosts)} 台主机)...")
+                    results = []
+                    completed = 0
 
-                with ThreadPoolExecutor(max_workers=min(threads, len(hosts))) as executor:
-                    futures = {executor.submit(scan_host, ip, threads): ip for ip in hosts}
-                    for future in as_completed(futures):
-                        try:
-                            r = future.result()
-                            results.append(r)
-                        except Exception as e:
-                            self._log(f"[!] 扫描失败: {future.result()}: {e}")
-                        completed += 1
-                        self.root.after(0, lambda c=completed, t=len(hosts): self._update_status(f"扫描进度: {c}/{t}"))
+                    with ThreadPoolExecutor(max_workers=min(threads, len(hosts))) as executor:
+                        futures = {executor.submit(scan_host, ip, threads): ip for ip in hosts}
+                        for future in as_completed(futures):
+                            try:
+                                r = future.result()
+                                results.append(r)
+                            except Exception as e:
+                                self._log(f"[!] 扫描失败: {e}")
+                            completed += 1
+                            self.root.after(0, lambda c=completed, t=len(hosts): self._update_status(f"扫描进度: {c}/{t}"))
 
                 self._log(f"[*] 扫描完成! 共 {len(hosts)} 台主机")
 
                 # 过滤
-                if scan_cves_only:
+                if scan_cves_only and not is_port_scan:
                     results = [r for r in results if r["summary"]["vulnerabilities_count"] > 0]
                     self._log(f"[+] 过滤后: {len(results)} 台有漏洞的主机")
 
@@ -660,7 +724,8 @@ class ScanGUI:
                 if total_high > 0:
                     self._log(f"⚠️  发现 {total_high} 个高危漏洞！")
 
-                self.root.after(0, lambda: messagebox.showinfo("扫描完成", f"扫描完成！\n发现 {len(hosts)} 台主机\n报告已保存: {output_file}"))
+                mode_label = "端口探测" if is_port_scan else "扫描"
+                self.root.after(0, lambda: messagebox.showinfo("扫描完成", f"{mode_label}完成！\n发现 {len(hosts)} 台主机\n报告已保存: {output_file}"))
 
             except Exception as e:
                 self._log(f"[!] 扫描出错: {e}")
@@ -669,6 +734,131 @@ class ScanGUI:
                 self.root.after(0, self._finish_scan)
 
         threading.Thread(target=run_scan, daemon=True).start()
+
+    def _parse_port_scan_input(self, port_str):
+        """解析端口探测输入，返回 (ip, [ports])"""
+        port_str = port_str.strip()
+        if not port_str:
+            return None, []
+
+        # 支持格式: "192.168.1.1", "192.168.1.1:80,443", "192.168.1.1:all"
+        if ":" in port_str:
+            parts = port_str.rsplit(":", 1)
+            host = parts[0].strip()
+            ports_part = parts[1].strip()
+
+            if ports_part == "all":
+                # 扫描所有已知端口
+                ports = sorted(SCAN_PORTS.keys())
+            else:
+                # 解析端口列表，支持范围如 1-1024
+                ports = []
+                for p in ports_part.split(","):
+                    p = p.strip()
+                    if "-" in p:
+                        try:
+                            start, end = p.split("-", 1)
+                            ports.extend(range(int(start), int(end) + 1))
+                        except ValueError:
+                            pass
+                    else:
+                        try:
+                            ports.append(int(p))
+                        except ValueError:
+                            pass
+            return host, sorted(set(ports))
+        else:
+            # 只有 IP，扫描所有已知端口
+            return port_str, sorted(SCAN_PORTS.keys())
+
+    def _scan_single_host(self, ip, target_ports, thread_pool_size):
+        """对单个主机进行端口探测"""
+        results = {
+            "ip": ip,
+            "open_ports": [],
+            "vulnerabilities": [],
+            "web_admin": [],
+            "summary": {},
+        }
+
+        open_ports = []
+
+        with ThreadPoolExecutor(max_workers=min(thread_pool_size, len(target_ports))) as executor:
+            futures = {executor.submit(self._probe_port, ip, port): port for port in target_ports}
+            for f in as_completed(futures):
+                try:
+                    port, status, service, cve, desc, banner, severity = f.result()
+                    if status == "open":
+                        open_ports.append(port)
+                        findings = {
+                            "port": port,
+                            "service": service,
+                            "cve": cve,
+                            "description": desc,
+                            "banner": banner,
+                            "severity": severity,
+                        }
+                        results["open_ports"].append(findings)
+                except Exception:
+                    pass
+
+        # Web 后台检测
+        if self.check_web.get():
+            web_ports = [p for p in open_ports if p in (80, 443, 8080, 8443, 9090)]
+            for wp in web_ports:
+                admin_findings = check_web_admin(ip, wp)
+                if admin_findings:
+                    results["web_admin"].extend(admin_findings)
+
+        vuln_count = sum(1 for p in results["open_ports"] if p.get("cve"))
+        high_count = sum(1 for p in results["open_ports"] if p.get("severity") == "high")
+        results["summary"] = {
+            "open_ports_count": len(open_ports),
+            "vulnerabilities_count": vuln_count,
+            "high_severity": high_count,
+            "web_admin_findings": len(results["web_admin"]),
+        }
+
+        results["open_ports"].sort(key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x.get("severity", "low"), 3))
+        return results
+
+    def _probe_port(self, ip, port, timeout=1.5):
+        """探测单个端口是否开放"""
+        svc = SCAN_PORTS.get(port)
+        if svc:
+            service, cve, desc = svc
+        else:
+            service = f"Port-{port}"
+            cve = None
+            desc = "未知服务"
+
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            conn_result = s.connect_ex((ip, port))
+            if conn_result != 0:
+                s.close()
+                return (port, "closed", service, cve, desc, "", "low")
+
+            banner = ""
+            try:
+                banner = s.recv(1024).decode("utf-8", errors="ignore").strip()
+            except:
+                pass
+            s.close()
+
+            severity = "low"
+            if banner:
+                severity = "medium"
+                if "vsftpd 3.0.3" in banner.lower():
+                    severity = "high"
+                if "openssh 7." in banner.lower() or "openssh 8." in banner.lower():
+                    severity = "high"
+
+            return (port, "open", service, cve, desc, banner, severity)
+
+        except (socket.timeout, OSError, ConnectionRefusedError):
+            return (port, "closed", service, cve, desc, "", "low")
 
     def _stop_scan(self):
         self._log("[!] 用户取消扫描")
@@ -696,6 +886,78 @@ class ScanGUI:
 
 
 # ====================================================================
+# CLI 辅助函数
+# ====================================================================
+
+def _parse_cli_port_input(port_str):
+    """解析 CLI 端口探测输入"""
+    port_str = port_str.strip()
+    if not port_str:
+        return None, []
+
+    if ":" in port_str:
+        parts = port_str.rsplit(":", 1)
+        host = parts[0].strip()
+        ports_part = parts[1].strip()
+
+        if ports_part == "all":
+            ports = sorted(SCAN_PORTS.keys())
+        else:
+            ports = []
+            for p in ports_part.split(","):
+                p = p.strip()
+                if "-" in p:
+                    try:
+                        start, end = p.split("-", 1)
+                        ports.extend(range(int(start), int(end) + 1))
+                    except ValueError:
+                        pass
+                else:
+                    try:
+                        ports.append(int(p))
+                    except ValueError:
+                        pass
+        return host, sorted(set(ports))
+    else:
+        return port_str, sorted(SCAN_PORTS.keys())
+
+
+def _scan_single_host_cli(ip, target_ports, thread_pool_size):
+    """CLI 模式: 扫描单个主机端口"""
+    results = {
+        "ip": ip,
+        "open_ports": [],
+        "vulnerabilities": [],
+        "web_admin": [],
+        "summary": {},
+    }
+
+    with ThreadPoolExecutor(max_workers=min(thread_pool_size, len(target_ports))) as executor:
+        futures = {executor.submit(_probe_port, ip, port): port for port in target_ports}
+        for f in as_completed(futures):
+            try:
+                port, status, service, cve, desc, banner, severity = f.result()
+                if status == "open":
+                    results["open_ports"].append({
+                        "port": port, "service": service, "cve": cve,
+                        "description": desc, "banner": banner, "severity": severity,
+                    })
+            except Exception:
+                pass
+
+    vuln_count = sum(1 for p in results["open_ports"] if p.get("cve"))
+    high_count = sum(1 for p in results["open_ports"] if p.get("severity") == "high")
+    results["summary"] = {
+        "open_ports_count": len(results["open_ports"]),
+        "vulnerabilities_count": vuln_count,
+        "high_severity": high_count,
+        "web_admin_findings": 0,
+    }
+    results["open_ports"].sort(key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x.get("severity", "low"), 3))
+    return results
+
+
+# ====================================================================
 # 主流程
 # ====================================================================
 
@@ -708,6 +970,7 @@ def parse_args():
     parser.add_argument("--json", type=str, default=None, help="同时输出 JSON 文件")
     parser.add_argument("--threads", type=int, default=THREAD_POOL_SIZE, help="并发线程数")
     parser.add_argument("--cli", action="store_true", help="强制命令行模式")
+    parser.add_argument("--port-scan", type=str, metavar="IP:PORTS", help="端口探测: IP 或 IP:port1,port2 或 IP:all")
     parser.add_argument("--help", "-h", action="store_true", help="显示帮助")
     return parser.parse_args()
 
@@ -716,6 +979,47 @@ def cli_main(args):
     """命令行模式主函数"""
     start_time = time.time()
 
+    # 端口探测模式
+    if args.port_scan:
+        host, ports = _parse_cli_port_input(args.port_scan)
+        if not host:
+            print("[!] 无效的端口探测格式，用法: --port-scan IP[:ports]")
+            print("    示例: --port-scan 192.168.1.1          # 扫描所有已知端口")
+            print("         --port-scan 192.168.1.1:80,443   # 扫描指定端口")
+            print("         --port-scan 192.168.1.1:all      # 扫描所有端口")
+            print("         --port-scan 192.168.1.1:1-1024   # 扫描端口范围")
+            return
+
+        output_file = args.output or f"scan_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+        print(f"[*] 端口探测: {host} 端口: {','.join(str(p) for p in ports) if ports else '全部'}")
+
+        results = []
+        with ThreadPoolExecutor(max_workers=min(args.threads, 1)) as executor:
+            future = executor.submit(_scan_single_host_cli, host, ports, args.threads)
+            results.append(future.result())
+
+        print("=" * 60)
+        print("  📊 端口探测结果")
+        print("=" * 60)
+        for r in results:
+            s = r["summary"]
+            print(f"\n  🖥️  {r['ip']}")
+            print(f"     开放端口: {s['open_ports_count']} | 漏洞: {s['vulnerabilities_count']} | 高危: {s['high_severity']}")
+            for p in r["open_ports"][:10]:
+                sev = p.get("severity", "?").upper()
+                cve = p.get("cve", "")
+                tag = f"[{sev}]" if sev else "[  ]"
+                cve_str = f" {cve}" if cve else ""
+                banner_str = f"  banner: {p.get('banner','')}" if p.get("banner") else ""
+                print(f"       {tag} {p['port']}/tcp {p['service']:15s}{cve_str}{banner_str}")
+
+        elapsed = time.time() - start_time
+        generate_html_report(results, output_file)
+        print(f"\n[*] HTML 报告已保存到: {os.path.abspath(output_file)}")
+        print(f"\n[*] 总耗时: {elapsed:.1f} 秒")
+        return
+
+    # 常规扫描模式
     if args.ips:
         hosts = [i.strip() for i in args.ips.split(",") if i.strip()]
     elif args.net == "auto":
@@ -789,7 +1093,7 @@ def main():
         return
 
     # 如果有 CLI 参数则走命令行模式，否则启动 GUI
-    if args.cli or args.ips or args.net != "auto" or args.json:
+    if args.cli or args.ips or args.net != "auto" or args.json or args.port_scan:
         cli_main(args)
     else:
         root = tk.Tk()

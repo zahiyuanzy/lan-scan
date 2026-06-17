@@ -472,19 +472,25 @@ class ScanGUI:
         input_frame = ttk.LabelFrame(self.root, text="扫描目标", padding=10)
         input_frame.pack(fill="x", padx=10, pady=5)
 
-        self.net_entry = ttk.Entry(input_frame, width=40)
+        # Container frame to hold exactly one input row, always left-aligned
+        self.input_row_frame = ttk.Frame(input_frame)
+        self.input_row_frame.pack(fill="x", padx=5, pady=2)
+
+        self.net_entry = ttk.Entry(self.input_row_frame, width=40)
         self.net_entry.insert(0, "auto")
-        self.net_entry_label = ttk.Label(input_frame, text="网段 (CIDR，如 192.168.1.0/24，填 auto 自动检测)")
+        self.net_entry_label = ttk.Label(self.input_row_frame, text="网段 (CIDR，如 192.168.1.0/24，填 auto 自动检测)")
         self.net_entry_label.pack(side="left", padx=(0, 5))
         self.net_entry.pack(side="left", fill="x", expand=True)
 
-        self.ips_entry = ttk.Entry(input_frame, width=40)
+        self.ips_entry = ttk.Entry(self.input_row_frame, width=40)
         self.ips_entry.pack_forget()
+        self.ips_hint_label = ttk.Label(self.input_row_frame, text="")
+        self.ips_hint_label.pack_forget()
 
         # Port scan target input
-        self.port_entry = ttk.Entry(input_frame, width=40)
+        self.port_entry = ttk.Entry(self.input_row_frame, width=40)
         self.port_entry.pack_forget()
-        self.port_entry_label = ttk.Label(input_frame, text="目标IP + 端口范围（如 192.168.1.1 或 192.168.1.1:80,443,8080 或 all）")
+        self.port_entry_label = ttk.Label(self.input_row_frame, text="")
         self.port_entry_label.pack_forget()
 
         # ===== 高级选项 =====
@@ -560,18 +566,13 @@ class ScanGUI:
         self.ips_entry.delete(0, "end")
         self.port_entry.delete(0, "end")
 
-        # Reset all to hidden
+        # Hide everything first
         self.net_entry.pack_forget()
         self.net_entry_label.pack_forget()
         self.ips_entry.pack_forget()
+        self.ips_hint_label.pack_forget()
         self.port_entry.pack_forget()
-        # Remove any extra hint labels from previous mode
-        for w in self.net_entry.master.winfo_children():
-            if isinstance(w, ttk.Label) and w not in (self.net_entry_label, self.port_entry_label):
-                try:
-                    w.pack_forget()
-                except:
-                    pass
+        self.port_entry_label.pack_forget()
 
         if mode == "subnet":
             self.net_entry.insert(0, "auto")
@@ -579,10 +580,13 @@ class ScanGUI:
             self.net_entry_label.pack(side="left")
         elif mode == "ips":
             self.ips_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
-            ttk.Label(self.ips_entry.master, text="多个IP用逗号或换行分隔，如 192.168.1.1,192.168.1.2").pack(side="left")
+            self.ips_hint_label.configure(text="多个IP用逗号或换行分隔，如 192.168.1.1,192.168.1.2")
+            self.ips_hint_label.pack(side="left")
         elif mode == "port_scan":
             self.port_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
-            ttk.Label(self.port_entry.master, text="目标IP:端口（如 192.168.1.1 或 192.168.1.1:80,443 或 all）").pack(side="left")
+            self.port_entry_label.configure(text="目标IP:端口（如 192.168.1.1 或 192.168.1.1:80,443 或 all）")
+            self.port_entry_label.pack(side="left")
+        # auto mode: nothing to show
 
     def _browse_output(self):
         path = filedialog.asksaveasfilename(

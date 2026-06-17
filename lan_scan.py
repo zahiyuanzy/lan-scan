@@ -819,7 +819,7 @@ class ScanGUI:
                 var = tk.BooleanVar(value=False)
                 self.iface_checkboxes.append((row_frame, var, net_info))
 
-                ttk.Checkbutton(row_frame, variable=var, selectcolor="#16213e").pack(side="left")
+                tk.Checkbutton(row_frame, variable=var, selectcolor="#16213e").pack(side="left")
                 ttk.Label(row_frame, text=f"IP: {net_info['ip']}", foreground="#ccc").pack(side="left", padx=(5, 10))
 
                 subnet_label = ttk.Label(row_frame, text="[ ] /24", foreground="#888", cursor="hand2")

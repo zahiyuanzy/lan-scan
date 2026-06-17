@@ -664,6 +664,7 @@ class ScanGUI:
 
         def run_scan():
             try:
+                mode = self.mode_var.get()
                 hosts = []
                 target_ports = []
                 is_port_scan = False

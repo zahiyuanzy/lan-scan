@@ -749,7 +749,7 @@ class ScanGUI:
 
             except Exception as e:
                 self._log(f"[!] 扫描出错: {e}")
-                self.root.after(0, lambda: messagebox.showerror("错误", str(e)))
+                self.root.after(0, lambda err=e: messagebox.showerror("错误", str(err)))
             finally:
                 self.root.after(0, self._finish_scan)
 

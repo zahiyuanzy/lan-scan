@@ -125,6 +125,154 @@ def get_local_network():
     return "192.168.0.0/16"
 
 
+def get_all_local_interfaces():
+    """获取本机所有网络接口的IP地址和所属网段"""
+    interfaces = []
+
+    if sys.platform == "darwin":
+        # macOS: use networksetup to list interfaces, then ifconfig for IPs
+        try:
+            result = subprocess.run(
+                ["networksetup", "-listallhardwareports"],
+                capture_output=True, text=True, timeout=10
+            )
+            current = None
+            for line in result.stdout.split("\n"):
+                line = line.strip()
+                if line.startswith("Hardware port:"):
+                    if current:
+                        interfaces.append(current)
+                    current = {"name": line.split(":", 1)[1].strip(), "ips": []}
+                elif line.startswith("Serial Number:"):
+                    continue
+                elif line.startswith("Device:") or line.startswith("Ethernet address:"):
+                    continue
+            if current:
+                interfaces.append(current)
+        except Exception:
+            pass
+
+        # If networksetup found nothing, fall back to ifconfig
+        if not interfaces:
+            try:
+                result = subprocess.run(
+                    ["ifconfig", "-a"], capture_output=True, text=True, timeout=10
+                )
+                current = None
+                for line in result.stdout.split("\n"):
+                    if line and not line.startswith("\t"):
+                        if ":" in line:
+                            if current:
+                                interfaces.append(current)
+                            name = line.split(":")[0].strip()
+                            current = {"name": name, "ips": []}
+                    elif line.startswith("\tinet ") and current is not None:
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            current["ips"].append(parts[1])
+                if current:
+                    interfaces.append(current)
+            except Exception:
+                pass
+    elif sys.platform == "win32":
+        # Windows: use ipconfig
+        try:
+            result = subprocess.run(
+                ["ipconfig", "/all"], capture_output=True, text=True, timeout=10
+            )
+            current = {}
+            in_interface = False
+            for line in result.stdout.split("\n"):
+                line_stripped = line.strip()
+                if line_stripped and not line.startswith("   ") and ":" in line_stripped:
+                    if current and in_interface:
+                        interfaces.append(current)
+                    name = line_stripped.split(":")[0].strip()
+                    current = {"name": name, "ips": []}
+                    in_interface = True
+                elif "IPv4 Address" in line_stripped and current is not None:
+                    parts = line_stripped.split(":")
+                    if len(parts) >= 2:
+                        ip = parts[-1].strip()
+                        current["ips"].append(ip)
+                elif "IP Address" in line_stripped and "IPv6" not in line_stripped and current is not None:
+                    parts = line_stripped.split(":")
+                    if len(parts) >= 2:
+                        ip = parts[-1].strip()
+                        current["ips"].append(ip)
+            if current and in_interface:
+                interfaces.append(current)
+        except Exception:
+            pass
+    else:
+        # Linux: use ip addr
+        try:
+            result = subprocess.run(
+                ["ip", "-4", "addr"], capture_output=True, text=True, timeout=10
+            )
+            current = {}
+            for line in result.stdout.split("\n"):
+                line = line.strip()
+                if line and not line.startswith(" ") and ":" in line:
+                    if current:
+                        interfaces.append(current)
+                    name = line.split(":")[1].strip()
+                    current = {"name": name, "ips": []}
+                elif "inet " in line and current is not None:
+                    parts = line.split()
+                    for i, p in enumerate(parts):
+                        if p == "inet" and i + 1 < len(parts):
+                            cidr = parts[i + 1]
+                            # Extract IP from CIDR
+                            ip = cidr.split("/")[0]
+                            current["ips"].append(ip)
+                            break
+            if current:
+                interfaces.append(current)
+        except Exception:
+            pass
+
+    # Filter out loopback, VPN, and empty interfaces
+    vpn_prefixes = ("utun", "tap", "tun", "wg")
+    filtered = []
+    for iface in interfaces:
+        name_lower = iface["name"].lower()
+        if "lo" in name_lower or "loopback" in name_lower:
+            continue
+        if any(name_lower.startswith(vp) for vp in vpn_prefixes):
+            continue
+        if iface["ips"]:
+            filtered.append(iface)
+    return filtered
+
+
+def get_networks_from_interfaces(interfaces):
+    """从接口列表构建可选的网段信息"""
+    networks = []
+    for iface in interfaces:
+        for ip in iface["ips"]:
+            try:
+                addr = ipaddress.ip_address(ip)
+                if not addr.is_private:
+                    continue
+                # Determine subnet based on IP class
+                parts = ip.split(".")
+                prefix_len = len(parts)
+                if prefix_len == 4:
+                    # Try /24 first, then /16
+                    subnet_24 = f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+                    subnet_16 = f"{parts[0]}.{parts[1]}.0.0/16"
+                    networks.append({
+                        "interface": iface["name"],
+                        "ip": ip,
+                        "subnet_24": subnet_24,
+                        "subnet_16": subnet_16,
+                    })
+            except Exception:
+                continue
+    return networks
+
+
 def discover_hosts(net_cidr="auto", thread_pool_size=64):
     """ARP 扫描发现存活主机（快速、免 root）"""
     if net_cidr == "auto":
@@ -453,6 +601,8 @@ class ScanGUI:
         self.root.geometry("720x520")
         self.root.resizable(True, True)
         self.scanning = False
+        self._stop_flag = False
+        self._executor = None
 
         self._build_ui()
 
@@ -461,9 +611,10 @@ class ScanGUI:
         mode_frame = ttk.LabelFrame(self.root, text="扫描模式", padding=10)
         mode_frame.pack(fill="x", padx=10, pady=(10, 5))
 
-        self.mode_var = tk.StringVar(value="subnet")
+        self.mode_var = tk.StringVar(value="auto")
         self.mode_var.trace_add("write", lambda *args: self._on_mode_change())
         ttk.Radiobutton(mode_frame, text="自动扫描（检测本机网段）", variable=self.mode_var, value="auto").pack(side="left", padx=10)
+        ttk.Radiobutton(mode_frame, text="网卡选择", variable=self.mode_var, value="iface_select").pack(side="left", padx=10)
         ttk.Radiobutton(mode_frame, text="指定网段", variable=self.mode_var, value="subnet").pack(side="left", padx=10)
         ttk.Radiobutton(mode_frame, text="指定IP", variable=self.mode_var, value="ips").pack(side="left", padx=10)
         ttk.Radiobutton(mode_frame, text="端口探测", variable=self.mode_var, value="port_scan").pack(side="left", padx=10)
@@ -492,6 +643,29 @@ class ScanGUI:
         self.port_entry.pack_forget()
         self.port_entry_label = ttk.Label(self.input_row_frame, text="")
         self.port_entry_label.pack_forget()
+
+        # ===== 网卡选择区 =====
+        self.iface_frame = ttk.LabelFrame(self.root, text="网卡选择", padding=10)
+        self.iface_frame.pack(fill="x", padx=10, pady=5)
+        self.iface_frame.pack_forget()
+
+        self.iface_list_frame = ttk.Frame(self.iface_frame)
+        self.iface_list_frame.pack(fill="both", expand=True, pady=(0, 8))
+
+        self.iface_canvas = tk.Canvas(self.iface_list_frame, bg="#1a1a2e", highlightthickness=0)
+        self.iface_scrollbar = ttk.Scrollbar(self.iface_list_frame, orient="vertical", command=self.iface_canvas.yview)
+        self.iface_inner_frame = ttk.Frame(self.iface_canvas)
+        self.iface_scrollbar_command = self.iface_canvas.yview
+        self.iface_canvas.configure(yscrollcommand=self.iface_scrollbar.set)
+        self.iface_scrollbar.pack(side="right", fill="y")
+        self.iface_canvas.pack(side="left", fill="both", expand=True)
+        self.iface_canvas.create_window((0, 0), window=self.iface_inner_frame, anchor="nw")
+        self.iface_canvas.bind("<Configure>", lambda e: self.iface_canvas.configure(scrollregion=self.iface_canvas.bbox("all")))
+
+        self.iface_checkboxes = []  # list of (subnet_label, checkbox_var, subnet_string)
+        self.iface_scan_type_var = tk.StringVar(value="subnet_24")
+
+        ttk.Button(self.iface_frame, text="🔄 刷新网卡列表", command=self._refresh_interfaces).pack(fill="x")
 
         # ===== 高级选项 =====
         advanced_frame = ttk.LabelFrame(self.root, text="高级选项", padding=10)
@@ -573,6 +747,7 @@ class ScanGUI:
         self.ips_hint_label.pack_forget()
         self.port_entry.pack_forget()
         self.port_entry_label.pack_forget()
+        self.iface_frame.pack_forget()
 
         if mode == "subnet":
             self.net_entry.insert(0, "auto")
@@ -586,6 +761,9 @@ class ScanGUI:
             self.port_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
             self.port_entry_label.configure(text="目标IP:端口（如 192.168.1.1 或 192.168.1.1:80,443 或 all）")
             self.port_entry_label.pack(side="left")
+        elif mode == "iface_select":
+            self.iface_frame.pack(fill="x", padx=10, pady=5)
+            self._refresh_interfaces()
         # auto mode: nothing to show
 
     def _browse_output(self):
@@ -607,10 +785,93 @@ class ScanGUI:
         self.status_var.set(msg)
         self.root.update_idletasks()
 
+    def _refresh_interfaces(self):
+        """刷新网卡列表，显示所有可用的IP和网段供用户选择"""
+        # Clear existing checkboxes
+        for widget in self.iface_inner_frame.winfo_children():
+            widget.destroy()
+        self.iface_checkboxes.clear()
+
+        interfaces = get_all_local_interfaces()
+        if not interfaces:
+            ttk.Label(self.iface_inner_frame, text="未检测到网络接口", foreground="#888").pack(pady=10)
+            return
+
+        networks = get_networks_from_interfaces(interfaces)
+        if not networks:
+            ttk.Label(self.iface_inner_frame, text="未找到私有IP地址", foreground="#888").pack(pady=10)
+            return
+
+        # Group by interface
+        iface_groups = defaultdict(list)
+        for net in networks:
+            iface_groups[net["interface"]].append(net)
+
+        for iface_name, nets in iface_groups.items():
+            # Interface header
+            header = ttk.Label(self.iface_inner_frame, text=f"🖧 {iface_name}", font=("", 10, "bold"), foreground="#4ec9b0")
+            header.pack(fill="x", pady=(8, 2))
+
+            for net_info in nets:
+                row_frame = ttk.Frame(self.iface_inner_frame)
+                row_frame.pack(fill="x", padx=10, pady=1)
+
+                var = tk.BooleanVar(value=False)
+                self.iface_checkboxes.append((row_frame, var, net_info))
+
+                ttk.Checkbutton(row_frame, variable=var, selectcolor="#16213e").pack(side="left")
+                ttk.Label(row_frame, text=f"IP: {net_info['ip']}", foreground="#ccc").pack(side="left", padx=(5, 10))
+
+                subnet_label = ttk.Label(row_frame, text="[ ] /24", foreground="#888", cursor="hand2")
+                subnet_label.pack(side="left", padx=2)
+                subnet_label.bind("<Button-1>", lambda e, v=var, l=subnet_label: self._toggle_subnet_var(v, l, "24"))
+
+                subnet_label16 = ttk.Label(row_frame, text="[ ] /16", foreground="#888", cursor="hand2")
+                subnet_label16.pack(side="left", padx=2)
+                subnet_label16.bind("<Button-1>", lambda e, v=var, l=subnet_label16: self._toggle_subnet_var(v, l, "16"))
+
+                # Store references
+                subnet_label.var = var
+                subnet_label.subnet_type = "24"
+                subnet_label16.var = var
+                subnet_label16.subnet_type = "16"
+
+        # Scan type selector
+        type_frame = ttk.Frame(self.iface_inner_frame)
+        type_frame.pack(fill="x", pady=(8, 2))
+        ttk.Label(type_frame, text="扫描粒度:", foreground="#888").pack(side="left", padx=(0, 5))
+        ttk.Radiobutton(type_frame, text="/24 (精确)", variable=self.iface_scan_type_var, value="subnet_24").pack(side="left", padx=5)
+        ttk.Radiobutton(type_frame, text="/16 (宽泛)", variable=self.iface_scan_type_var, value="subnet_16").pack(side="left", padx=5)
+
+    def _toggle_subnet_var(self, var, label, subnet_type):
+        """点击 /24 或 /16 标签时同步勾选/取消复选框"""
+        var.set(not var.get())
+        color = "#4ec9b0" if var.get() else "#888"
+        label.config(foreground=color)
+
+    def _get_iface_targets(self):
+        """获取网卡选择模式下选中的网段"""
+        subnets = []
+        scan_type = self.iface_scan_type_var.get()
+        for item in self.iface_checkboxes:
+            row_frame, var, net_info = item
+            if var.get():
+                if scan_type == "subnet_24":
+                    subnets.append(net_info["subnet_24"])
+                else:
+                    subnets.append(net_info["subnet_16"])
+        return list(set(subnets))  # deduplicate
+
     def _get_targets(self):
         mode = self.mode_var.get()
         if mode == "auto":
             return "auto", None, None
+        elif mode == "iface_select":
+            subnets = self._get_iface_targets()
+            if not subnets:
+                messagebox.showwarning("提示", "请至少选择一个网卡或子网")
+                return None, None, None
+            return subnets, None, None
         elif mode == "subnet":
             net = self.net_entry.get().strip()
             if not net:
@@ -638,6 +899,12 @@ class ScanGUI:
         self.net_entry.configure(state="disabled" if scanning else "normal")
         self.ips_entry.configure(state="disabled" if scanning else "normal")
         self.port_entry.configure(state="disabled" if scanning else "normal")
+        # Disable interface selection widgets during scan
+        for widget in self.iface_inner_frame.winfo_children():
+            try:
+                widget.configure(state="disabled" if scanning else "normal")
+            except Exception:
+                pass
         for rb in self.root.winfo_children():
             for w in rb.winfo_children():
                 if isinstance(w, ttk.Radiobutton):
@@ -673,6 +940,19 @@ class ScanGUI:
                     self._update_status("正在检测本机网段...")
                     self._log("[+] 自动检测本机网段...")
                     hosts = discover_hosts(thread_pool_size=threads)
+                elif mode == "iface_select":
+                    self._update_status("正在合并选中的网段...")
+                    self._log(f"[+] 网卡选择模式: {len(net_or_subnet)} 个子网")
+                    # Merge all selected subnets into one scan
+                    all_hosts = []
+                    for idx, subnet in enumerate(net_or_subnet):
+                        if self._stop_flag:
+                            return
+                        self._update_status(f"正在扫描网段 {subnet} ({idx+1}/{len(net_or_subnet)})...")
+                        self._log(f"[+] 扫描子网: {subnet}")
+                        subnet_hosts = discover_hosts(subnet, thread_pool_size=threads)
+                        all_hosts.extend(subnet_hosts)
+                    hosts = sorted(set(all_hosts))
                 elif mode == "subnet":
                     self._update_status(f"正在扫描网段 {net_or_subnet}...")
                     self._log(f"[+] 网段: {net_or_subnet}")
@@ -702,8 +982,12 @@ class ScanGUI:
                     total = len(hosts)
 
                     with ThreadPoolExecutor(max_workers=min(threads, len(hosts))) as executor:
+                        self._executor = executor
                         futures = {executor.submit(self._scan_single_host, ip, target_ports, threads): ip for ip in hosts}
                         for future in as_completed(futures):
+                            if self._stop_flag:
+                                executor.shutdown(wait=False, cancel_futures=True)
+                                break
                             try:
                                 r = future.result()
                                 results.append(r)
@@ -719,8 +1003,12 @@ class ScanGUI:
                     completed = 0
 
                     with ThreadPoolExecutor(max_workers=min(threads, len(hosts))) as executor:
+                        self._executor = executor
                         futures = {executor.submit(scan_host, ip, threads): ip for ip in hosts}
                         for future in as_completed(futures):
+                            if self._stop_flag:
+                                executor.shutdown(wait=False, cancel_futures=True)
+                                break
                             try:
                                 r = future.result()
                                 results.append(r)
@@ -729,7 +1017,11 @@ class ScanGUI:
                             completed += 1
                             self.root.after(0, lambda c=completed, t=len(hosts): self._update_status(f"扫描进度: {c}/{t}"))
 
-                self._log(f"[*] 扫描完成! 共 {len(hosts)} 台主机")
+                # If stopped early, still save what we have
+                if self._stop_flag:
+                    self._log(f"[!] 扫描已被用户中断，已收集 {len(results)} 台主机的数据")
+                else:
+                    self._log(f"[*] 扫描完成! 共 {len(hosts)} 台主机")
 
                 # 过滤
                 if scan_cves_only and not is_port_scan:
@@ -741,12 +1033,13 @@ class ScanGUI:
                 generate_html_report(results, output_file)
                 self._log(f"[+] HTML 报告已保存: {os.path.abspath(output_file)}")
 
-                total_high = sum(r["summary"]["high_severity"] for r in results)
-                if total_high > 0:
-                    self._log(f"⚠️  发现 {total_high} 个高危漏洞！")
+                if not self._stop_flag:
+                    total_high = sum(r["summary"]["high_severity"] for r in results)
+                    if total_high > 0:
+                        self._log(f"⚠️  发现 {total_high} 个高危漏洞！")
 
-                mode_label = "端口探测" if is_port_scan else "扫描"
-                self.root.after(0, lambda: messagebox.showinfo("扫描完成", f"{mode_label}完成！\n发现 {len(hosts)} 台主机\n报告已保存: {output_file}"))
+                    mode_label = "端口探测" if is_port_scan else "扫描"
+                    self.root.after(0, lambda: messagebox.showinfo("扫描完成", f"{mode_label}完成！\n发现 {len(hosts)} 台主机\n报告已保存: {output_file}"))
 
             except Exception as e:
                 self._log(f"[!] 扫描出错: {e}")
@@ -882,10 +1175,20 @@ class ScanGUI:
             return (port, "closed", service, cve, desc, "", "low")
 
     def _stop_scan(self):
-        self._log("[!] 用户取消扫描")
+        self._stop_flag = True
+        self._log("[!] 正在停止扫描...")
+        # Cancel all pending futures in the executor
+        if self._executor:
+            try:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            self._executor = None
+        self._log("[!] 扫描已取消")
         self._finish_scan()
 
     def _finish_scan(self):
+        self._stop_flag = False
         self.progress.stop()
         self._toggle_ui(False)
         self._update_status("就绪")
